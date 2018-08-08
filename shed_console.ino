@@ -17,14 +17,24 @@
 #include <EthernetClient.h>
 #include <Dns.h>
 #include <Dhcp.h>
+#include <Adafruit_Sensor.h>
+
+#include <DHT.h>
+#include <DHT_U.h>
 
 /************************* Adafruit.io Setup *********************************/
-#define VERSION_MESSAGE F("Shed Console v0.11 28/07/18")
+#define VERSION_MESSAGE F("Shed Console v0.13 29/07/18")
 
-#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVER      "192.168.2.20"
 #define AIO_SERVERPORT  1883
-#define AIO_USERNAME    "eibjj"
-#define AIO_KEY         "6f6434be6d39451fb4df71877816979e"
+#define AIO_USERNAME    "mosquitto"
+#define AIO_KEY         "qq211"
+
+#define DHT_PIN 7
+#define DHT_VCC_PIN 2
+#define LIGHT_PIN 6
+#define LEDLIGHT_PIN 5
+
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.shed"
 #define SERVER_LISTEN_PORT 80
 #define MQTT_CONNECT_RETRY_MAX 5
@@ -33,6 +43,12 @@
 byte mac[] = {0xBE, 0xBD, 0xEE, 0xEF, 0xFE, 0xFD};
 //IPAddress iotIP (192, 168, 0, 103);
 
+// Uncomment the type of sensor in use:
+#define DHT_TYPE DHT11     // DHT 22 (AM2302)
+DHT_Unified dht(DHT_PIN, DHT_TYPE);
+
+unsigned long sensorDelayMs;
+unsigned long lastSensorRead = 0;
 unsigned long lastPing = 0; // timestamp
 unsigned long connectedSince = 0; // timestamp
 unsigned long now = 0; // timestamp
@@ -43,6 +59,9 @@ EthernetClient client;
 EthernetServer server(SERVER_LISTEN_PORT);
 
 Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+
+Adafruit_MQTT_Publish temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/shed.temperature");
+Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/shed.humidity");
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
 Adafruit_MQTT_Subscribe shedled = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.shedled");
 Adafruit_MQTT_Subscribe shedlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.shedlight");
@@ -62,16 +81,84 @@ void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
   __resetFunc();
 }
 
-void setup() {
-  pinMode(2, OUTPUT);
-  digitalWrite(2, LOW);
 
-  pinMode(3, OUTPUT);
-  digitalWrite(3, LOW);
+void initSensor() {
+  // Initialize device.
+  dht.begin();
+
+  sensor_t sensor;
+  dht.temperature().getSensor(&sensor);
+  Serial.println(F("------------------------------------"));
+  Serial.println("Temperature");
+  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
+  Serial.print  ("Driver Ver:   "); Serial.println(sensor.version);
+  Serial.print  ("Unique ID:    "); Serial.println(sensor.sensor_id);
+  Serial.print  ("Max Value:    "); Serial.print(sensor.max_value); Serial.println(" *C");
+  Serial.print  ("Min Value:    "); Serial.print(sensor.min_value); Serial.println(" *C");
+  Serial.print  ("Resolution:   "); Serial.print(sensor.resolution); Serial.println(" *C");
+
+  Serial.println("------------------------------------");
+  // Print humidity sensor details.
+  dht.humidity().getSensor(&sensor);
+  Serial.println(F("------------------------------------"));
+  Serial.println("Humidity");
+  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
+  Serial.print  ("Driver Ver:   "); Serial.println(sensor.version);
+  Serial.print  ("Unique ID:    "); Serial.println(sensor.sensor_id);
+  Serial.print  ("Max Value:    "); Serial.print(sensor.max_value); Serial.println("%");
+  Serial.print  ("Min Value:    "); Serial.print(sensor.min_value); Serial.println("%");
+  Serial.print  ("Resolution:   "); Serial.print(sensor.resolution); Serial.println("%");
+  Serial.print  ("Min Delay:    "); Serial.print(sensor.min_delay / 1000); Serial.println("ms");
+
+  Serial.println("------------------------------------");
+  // Set delay between sensor readings based on sensor details.
+  //sensorDelayMs = sensor.min_delay / 1000;
+  sensorDelayMs = 30000;
+}
+
+void readSensor() {
+
+  sensors_event_t event;
+  dht.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println(F("Error reading temperature!"));
+  }
+  else {
+    Serial.print(F("Temperature: "));
+    Serial.print(event.temperature);
+    Serial.println(F(" *C"));
+  }
+
+  temp.publish(event.temperature);
+
+  // Get humidity event and print its value.
+  dht.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println(F("Error reading humidity!"));
+  }
+  else {
+    Serial.print(F("Humidity: "));
+    Serial.print(event.relative_humidity);
+    Serial.println("%");
+  }
+
+  humid.publish(event.relative_humidity);
+}
+
+
+void setup() {
+  pinMode(DHT_VCC_PIN, OUTPUT);
+  digitalWrite(DHT_VCC_PIN, HIGH);
 
   // Disable SD card
   pinMode(4, OUTPUT);
   digitalWrite(4, HIGH);
+
+  pinMode(LIGHT_PIN, OUTPUT);
+  digitalWrite(LIGHT_PIN, HIGH);
+
+  pinMode(LEDLIGHT_PIN, OUTPUT);
+  digitalWrite(LEDLIGHT_PIN, HIGH);
   
   delay(2000);
 
@@ -85,6 +172,17 @@ void setup() {
   if (Ethernet.localIP() == IPAddress(0,0,0,0)) {
     resetFunc(F("DHCP resolution failed"), 30000);
   }
+
+    Serial.println(F("MQTT subscribe"));
+
+  //mqtt.subscribe(&lamptoggle);
+  mqtt.subscribe(&shedled);
+  mqtt.subscribe(&shedlight);
+  mqtt.will(WILL_FEED, "0");
+
+  server.begin();
+
+  initSensor();
 }
 
 
@@ -96,12 +194,22 @@ void loop() {
   // this is our 'wait for incoming subscription packets' busy subloop
   Adafruit_MQTT_Subscribe *subscription;
   while ((subscription = mqtt.readSubscription(1000))) {
+    Serial.print(F("Got: "));
+    Serial.println((char *)subscription->lastread);
     if (subscription == &shedled) {
-      Serial.print(F("Got: "));
-      Serial.println((char *)shedled.lastread);
+      if (strcmp((char *)subscription->lastread, "1") == 0) {
+        digitalWrite(LEDLIGHT_PIN, LOW);
+      }
+      if (strcmp((char *)subscription->lastread, "0") == 0) {
+        digitalWrite(LEDLIGHT_PIN, HIGH);
+      }
     } else if (subscription == &shedlight) {
-      Serial.print(F("Got: "));
-      Serial.println((char *)shedlight.lastread);
+      if (strcmp((char *)subscription->lastread, "1") == 0) {
+        digitalWrite(LIGHT_PIN, LOW);
+      }
+      if (strcmp((char *)subscription->lastread, "0") == 0) {
+        digitalWrite(LIGHT_PIN, HIGH);
+      }
     }
   }
 
@@ -115,6 +223,13 @@ void loop() {
   } else {
     Serial.println(F("OK!"));
   }*/
+  
+  // Get temperature event and print its value.
+  if (lastSensorRead + sensorDelayMs   < now) {
+    Serial.println(F("sensorRead"));
+    lastSensorRead = now;
+    readSensor();
+  }
 
   handleHttpClientRequest();
 
@@ -205,11 +320,6 @@ void handleHttpClientRequest() {
           client.print(F("<h1>"));
           client.print(VERSION_MESSAGE);
           client.println(F("</h1>"));
-          /*
-          client.print(F("<br />Light is "));
-          client.println(livingRoomLightState);
-          client.print(F("<br />Led is "));
-          client.println(livingRoomLightState);*/
           client.print(F("<br />Last ping "));
           client.print(lastPing);
           client.print(F("<br />Uptime "));

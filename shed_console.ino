@@ -1,3 +1,4 @@
+
 #include <SPI.h>
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
@@ -11,49 +12,60 @@
 #include <DHT.h>
 #include <DHT_U.h>
 
-/************************* Adafruit.io Setup *********************************/
-#define VERSION_MESSAGE F("Shed Console v0.13 29/07/18")
+#define VERSION_MESSAGE F("Shed Console v0.22 25/05/19")
 
-#define AIO_SERVER      "192.168.2.20"
+#define AIO_SERVER      "raspberry.home"
 #define AIO_SERVERPORT  1883
 #define AIO_USERNAME    "mosquitto"
 #define AIO_KEY         "qq211"
 
 #define DHT_PIN 7
-#define DHT_VCC_PIN 2
 #define LIGHT_PIN 6
 #define LEDLIGHT_PIN 5
+#define MOTION_SENSOR_PIN 21
+#define DOOR_PIN 8
+#define BUTTON_1_PIN 10
+#define BUTTON_2_PIN 11
 
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.shed"
 #define SERVER_LISTEN_PORT 80
-#define MQTT_CONNECT_RETRY_MAX 5
-#define MQTT_PING_INTERVAL_MS 60000
+#define mqttConnect_RETRY_MAX 5
+#define mqttPing_INTERVAL_MS 60000
+
+#define EDGE_NONE (int)-1
+#define TOGGLE_COMMAND (uint32_t)2
 
 byte mac[] = {0xBE, 0xBD, 0xEE, 0xEF, 0xFE, 0xFD};
-//IPAddress iotIP (192, 168, 0, 103);
 
-// Uncomment the type of sensor in use:
 #define DHT_TYPE DHT11     // DHT 22 (AM2302)
 DHT_Unified dht(DHT_PIN, DHT_TYPE);
 
-unsigned long sensorDelayMs;
-unsigned long lastSensorRead = 0;
-unsigned long lastPing = 0; // timestamp
-unsigned long connectedSince = 0; // timestamp
-unsigned long now = 0; // timestamp
-unsigned long nextConnectionAttempt = 0; // timestamp
-unsigned long failedConnectionAttempts = 0;
+uint32_t sensorDelayMs;
+uint32_t lastSensorRead = 0;
+uint32_t lastPing = 0; // timestamp
+uint32_t connectedSince = 0; // timestamp
+uint32_t now = 0; // timestamp
+uint32_t nextConnectionAttempt = 0; // timestamp
+uint32_t failedConnectionAttempts = 0;
 
 EthernetClient client;
 EthernetServer server(SERVER_LISTEN_PORT);
 
-Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+int lastState[50] = {0};
+float lastTemp;
+float lastHumid;
 
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+Adafruit_MQTT_Publish door = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/doors.shed");
 Adafruit_MQTT_Publish temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/shed.temperature");
 Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/shed.humidity");
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
+Adafruit_MQTT_Publish shedledPub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.shedled");
+Adafruit_MQTT_Publish shedlightPub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.shedlight");
+Adafruit_MQTT_Publish motion = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/shed.motion");
 Adafruit_MQTT_Subscribe shedled = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.shedled");
 Adafruit_MQTT_Subscribe shedlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.shedlight");
+
 
 /*************************** Sketch Code ************************************/
 
@@ -69,7 +81,6 @@ void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
   delay(delayMs);
   __resetFunc();
 }
-
 
 void initSensor() {
   // Initialize device.
@@ -118,6 +129,7 @@ void readSensor() {
     Serial.println(F(" *C"));
   }
 
+  lastTemp = event.temperature;
   temp.publish(event.temperature);
 
   // Get humidity event and print its value.
@@ -131,15 +143,34 @@ void readSensor() {
     Serial.println("%");
   }
 
+  lastHumid = event.relative_humidity;
   humid.publish(event.relative_humidity);
 }
 
 
-void setup() {
-  pinMode(DHT_VCC_PIN, OUTPUT);
-  digitalWrite(DHT_VCC_PIN, HIGH);
+void publishEdge(int pin, Adafruit_MQTT_Publish* pub, uint32_t fallingValue = LOW, uint32_t risingValue = HIGH) {
+  int result = detectEdge(pin);
+  if (result != EDGE_NONE) {
+    pub->publish(result == RISING ? risingValue : fallingValue);
+  }
+}
 
-  // Disable SD card
+int detectEdge(int pin) {
+  int state = digitalRead(pin);
+  int result = -1;
+  
+  if (state != lastState[pin]) {
+    result = state == HIGH ? RISING : FALLING;
+    Serial.print("State change on pin ");
+    Serial.print(result);
+    Serial.println(result == RISING ? " rising" : " falling");
+  }
+
+  lastState[pin] = state;
+  return result;
+}
+
+void setup() {
   pinMode(4, OUTPUT);
   digitalWrite(4, HIGH);
 
@@ -148,6 +179,18 @@ void setup() {
 
   pinMode(LEDLIGHT_PIN, OUTPUT);
   digitalWrite(LEDLIGHT_PIN, HIGH);
+
+  pinMode(MOTION_SENSOR_PIN, INPUT);
+  pinMode(DOOR_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
+
+  delay(100);    
+  
+  lastState[DOOR_PIN] = digitalRead(DOOR_PIN);
+  lastState[MOTION_SENSOR_PIN] = digitalRead(MOTION_SENSOR_PIN);
+  lastState[BUTTON_1_PIN] = digitalRead(BUTTON_1_PIN);
+  lastState[BUTTON_2_PIN] = digitalRead(BUTTON_2_PIN);
   
   delay(2000);
 
@@ -162,11 +205,10 @@ void setup() {
     resetFunc(F("DHCP resolution failed"), 30000);
   }
 
-    Serial.println(F("MQTT subscribe"));
+  Serial.println(F("MQTT subscribe"));
 
-  //mqtt.subscribe(&lamptoggle);
-  mqtt.subscribe(&shedled);
-  mqtt.subscribe(&shedlight);
+  mqtt.subscribe(&shedled, &onSubscriptionEvent);
+  mqtt.subscribe(&shedlight, &onSubscriptionEvent);
   mqtt.will(WILL_FEED, "0");
 
   server.begin();
@@ -174,77 +216,83 @@ void setup() {
   initSensor();
 }
 
-
 void loop() {
   now = millis();
   Ethernet.maintain();
-  MQTT_connect();
-
-  // this is our 'wait for incoming subscription packets' busy subloop
-  Adafruit_MQTT_Subscribe *subscription;
-  while ((subscription = mqtt.readSubscription(1000))) {
-    Serial.print(F("Got: "));
-    Serial.println((char *)subscription->lastread);
-    if (subscription == &shedled) {
-      if (strcmp((char *)subscription->lastread, "1") == 0) {
-        digitalWrite(LEDLIGHT_PIN, LOW);
-      }
-      if (strcmp((char *)subscription->lastread, "0") == 0) {
-        digitalWrite(LEDLIGHT_PIN, HIGH);
-      }
-    } else if (subscription == &shedlight) {
-      if (strcmp((char *)subscription->lastread, "1") == 0) {
-        digitalWrite(LIGHT_PIN, LOW);
-      }
-      if (strcmp((char *)subscription->lastread, "0") == 0) {
-        digitalWrite(LIGHT_PIN, HIGH);
-      }
-    }
-  }
-
-  /*
-  // Now we can publish stuff!
-  Serial.print(F("\nSending photocell val "));
-  Serial.print(x);
-  Serial.print("...");
-  if (! photocell.publish(x++)) {
-    Serial.println(F("Failed"));
-  } else {
-    Serial.println(F("OK!"));
-  }*/
+  mqttConnect();
+  
+  mqtt.process(100);
   
   // Get temperature event and print its value.
-  if (lastSensorRead + sensorDelayMs   < now) {
+  if (now - lastSensorRead > sensorDelayMs) {
     Serial.println(F("sensorRead"));
     lastSensorRead = now;
     readSensor();
   }
 
+  publishEdge(BUTTON_1_PIN, &shedlightPub, TOGGLE_COMMAND, TOGGLE_COMMAND);
+  publishEdge(BUTTON_2_PIN, &shedledPub, TOGGLE_COMMAND, TOGGLE_COMMAND);  
+  
+  publishEdge(MOTION_SENSOR_PIN, &motion);
+  publishEdge(DOOR_PIN, &door);
+
   handleHttpClientRequest();
 
-  MQTT_ping();
-  delay(1000);
+  mqttPing();
+  delay(100);
 }
 
-void MQTT_ping() {
-
-  if (!mqtt.connected()) {
-    return;
+void onPing(bool result) {
+  Serial.println("On async ping!");
+  if (!lastwill.publish(now)) {
+    Serial.println("Failed to publish last will!");
   }
+}
 
-  if (lastPing + MQTT_PING_INTERVAL_MS < now) {
-    Serial.println(F("Ping"));
-    lastPing = now;
-    if (!mqtt.ping()) {
-      Serial.println(F("Failed to ping"));
-      mqtt.disconnect();
-    } else {
-      lastwill.publish(now);
+void onSubscriptionEvent(Adafruit_MQTT_Subscribe* subscription) {
+  
+  Serial.print(F("Got: "));
+  Serial.println((char *)subscription->lastread);
+  if (subscription == &shedled) {
+    if (strcmp((char *)subscription->lastread, "1") == 0) {
+      digitalWrite(LEDLIGHT_PIN, LOW);
+    }
+    if (strcmp((char *)subscription->lastread, "0") == 0) {
+      digitalWrite(LEDLIGHT_PIN, HIGH);
+    }
+    if (strcmp((char *)subscription->lastread, "2") == 0) {
+      int val = digitalRead(LEDLIGHT_PIN);
+      digitalWrite(LEDLIGHT_PIN,  val == HIGH ? LOW : HIGH);
+      shedledPub.publish(val == HIGH ? "1" : "0");
+    }
+  } else if (subscription == &shedlight) {
+    if (strcmp((char *)subscription->lastread, "1") == 0) {
+      digitalWrite(LIGHT_PIN, LOW);
+    }
+    if (strcmp((char *)subscription->lastread, "0") == 0) {
+      digitalWrite(LIGHT_PIN, HIGH);
+    }
+    if (strcmp((char *)subscription->lastread, "2") == 0) {
+      int val = digitalRead(LIGHT_PIN);
+      digitalWrite(LIGHT_PIN, val == HIGH ? LOW : HIGH);
+      shedlightPub.publish(val == HIGH ? "1" : "0");
     }
   }
 }
 
-void MQTT_connect() {
+void mqttPing() {
+  if (!mqtt.connected()) {
+    return;
+  }
+
+  if (now - lastPing > mqttPing_INTERVAL_MS) {
+    Serial.println(F("Ping"));
+    lastPing = now;
+    mqtt.pingAsync(onPing);
+  }
+}
+
+void mqttConnect() {
   int8_t ret;
 
   // Stop if already connected.
@@ -259,7 +307,6 @@ void MQTT_connect() {
     if (ret = mqtt.connect() != 0) {
       Serial.print(F("Failed: "));
       Serial.println(mqtt.connectErrorString(ret));
-      //mqtt.disconnect();
 
       nextConnectionAttempt = now + delaySecs * 1000;
       ++failedConnectionAttempts;
@@ -269,7 +316,7 @@ void MQTT_connect() {
       connectedSince = millis();
       failedConnectionAttempts = 0;
       Serial.println(F("Connected!"));
-    } else if (failedConnectionAttempts > MQTT_CONNECT_RETRY_MAX) {
+    } else if (failedConnectionAttempts > mqttConnect_RETRY_MAX) {
       connectedSince = 0;
       resetFunc(F("Max retries exhausted!"), 2000); // Reset and try again
     } else {
@@ -315,6 +362,19 @@ void handleHttpClientRequest() {
           client.print(now);
           client.print(F("<br />Connected since "));
           client.print(connectedSince);
+          client.print(F("<br />"));
+          client.print(F("<br />Door "));
+          client.print(lastState[DOOR_PIN]);
+          client.print(F("<br />Motion "));
+          client.print(lastState[MOTION_SENSOR_PIN]);
+          client.print(F("<br />LED Light "));
+          client.print(lastState[LEDLIGHT_PIN]);
+          client.print(F("<br />Light "));
+          client.print(lastState[LIGHT_PIN]);
+          client.print(F("<br />Temperature "));
+          client.print(lastTemp);
+          client.print(F("<br />Humidity "));
+          client.print(lastHumid);
 
           client.println(F("<br />"));
 
